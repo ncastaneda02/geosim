@@ -3,7 +3,10 @@
 #include <math.h>
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
- 
+#include "photon_map.h"
+#include <glm/glm.hpp>
+#include <chrono>
+
 // CUDA kernel. Each thread takes care of one element of c
 __global__ void vecAdd(double *a, double *b, double *c, int n)
 {
@@ -110,5 +113,36 @@ int main( int argc, char* argv[] )
     }
     stbi_write_png("test.png", width, height, channels, pixels, width*channels);
 
+    auto map = new PhotonMap();
+    auto phots = new std::vector<PhotonMap::Photon>();
+    for (int i = 0; i < 1000000; i++) {
+        phots->emplace_back(glm::vec4(i, i, i, i), glm::vec4(0, 0, 0, 0), glm::vec4(0, 0, 0, 0));
+    }
+    
+    auto naive_start = std::chrono::high_resolution_clock::now();
+    glm::vec4 loc(1.4, 1.4, 1.4, 1.4);
+    int min_dist = 2000000;
+    PhotonMap::Photon naive_closest;
+    for (int i = 0; i < 1000000; i++) {
+        double dist = distance(loc, phots->at(i).position);
+        if (dist < min_dist) {
+            min_dist = dist;
+            naive_closest = phots->at(i);
+        }
+    }
+    auto naive_time = std::chrono::high_resolution_clock::now() - naive_start;
+
+    std::cout << "Naive nearest neighbor took " << naive_time.count() << ", and found the nearest neighbor (" << naive_closest.position.x << ", "
+              << naive_closest.position.y << ", " << naive_closest.position.z << ", " << naive_closest.position.w << ") with a distance of "
+              << min_dist << std::endl;
+
+    auto kd_start = std::chrono::high_resolution_clock::now();
+    map->buildMap(phots);
+    auto kd_closest = map->kNearestNeighbors(1, loc)[0];
+    auto kd_dist = distance(loc, kd_closest.position);
+    auto kd_time = std::chrono::high_resolution_clock::now() - kd_start;
+    std::cout << "KD nearest neighbor took " << kd_time.count() << ", and found the nearest neighbor (" << kd_closest.position.x << ", "
+              << kd_closest.position.y << ", " << kd_closest.position.z << ", " << kd_closest.position.w << ") with a distance of "
+              << kd_dist << std::endl;
     return 0;
 }
