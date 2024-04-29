@@ -1,148 +1,275 @@
+#include "cuda_runtime.h"
+#include "device_launch_parameters.h"
+#include "curand_kernel.h"
+
 #include <stdio.h>
-#include <stdlib.h>
-#include <math.h>
+#include <iostream>
+#include <string>
+#include <chrono>
+#include <vector>
+
+#include "sdf_util.hpp"
+
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
-#include "photon_map.h"
-#include <glm/glm.hpp>
-#include <chrono>
 
-// CUDA kernel. Each thread takes care of one element of c
-__global__ void vecAdd(double *a, double *b, double *c, int n)
+#define BLOCK_SIZE 8
+#define BOUNCES 2
+#define SAMPLES 8 // Total number of samples is SAMPLES*SAMPLES
+#define EPS 1e-5
+#define MINDIST 1.8e-3
+#define PUSH 0.0036f
+#define FRAMES 10
+
+// Purely random pixel sample
+inline glm::vec2 __device__ getRandomSample(curandState* state) 
 {
-    // Get our global thread ID
-    int id = blockIdx.x*blockDim.x+threadIdx.x;
- 
-    // Make sure we do not go out of bounds
-    if (id < n)
-        c[id] = a[id] + b[id];
+	return glm::vec2(curand_uniform(state), curand_uniform(state));
 }
- 
-int main( int argc, char* argv[] )
+
+// Random sample in nth subpixel
+inline glm::vec2 __device__ getJitteredSample(int n, curandState* state) {
+	glm::vec2 rand_vec = glm::vec2(curand_uniform(state) * (1.0f / SAMPLES), curand_uniform(state) * (1.0f / SAMPLES));
+	glm::vec2 result = glm::vec2((n % SAMPLES) * 1.0f / SAMPLES, (n / SAMPLES) * 1.0f / SAMPLES);
+	return result + rand_vec;
+}
+
+glm::vec3 __device__ orient(const glm::vec3& n, curandState* state) 
 {
-    // Size of vectors
-    int n = 100000;
- 
-    // Host input vectors
-    double *h_a;
-    double *h_b;
-    //Host output vector
-    double *h_c;
-    double *ref_c;
- 
-    // Device input vectors
-    double *d_a;
-    double *d_b;
-    //Device output vector
-    double *d_c;
- 
-    // Size, in bytes, of each vector
-    size_t bytes = n*sizeof(double);
- 
-    // Allocate memory for each vector on host
-    h_a = (double*)malloc(bytes);
-    h_b = (double*)malloc(bytes);
-    h_c = (double*)malloc(bytes);
-    ref_c = (double*)malloc(bytes);
- 
-    // Allocate memory for each vector on GPU
-    cudaMalloc(&d_a, bytes);
-    cudaMalloc(&d_b, bytes);
-    cudaMalloc(&d_c, bytes);
- 
-    int i;
-    // Initialize vectors on host
-    for( i = 0; i < n; i++ ) {
-        h_a[i] = sin(i)*sin(i);
-        h_b[i] = cos(i)*cos(i);
-    }
-    
-    // get reference sol
-    for (i = 0; i < n; i++) {
-        ref_c[i] = h_a[i] + h_b[i];
+	// rejection sampling hemisphere
+	float x = 1.0f, y = 1.0f;
+
+	while (x * x + y * y > 1.0f) 
+	{
+		x = (curand_uniform(state) - 0.5f) * 2.0f;
+		y = (curand_uniform(state) - 0.5f) * 2.0f;
+	}
+	float z = sqrtf(1 - x * x - y * y);
+	glm::vec3 in = normalize(glm::vec3(x, y, z));
+
+	// Create vector that is not the same as n
+	glm::vec3 absn = glm::abs(n);
+	glm::vec3 q = n;
+	if (absn.x <= absn.y && absn.x <= absn.z)  q.x = 1;
+	else if (absn.y <= absn.x && absn.y <= absn.z) q.y = 1;
+	else q.z = 1;
+
+	// Basis creation, result is just a rolled out matrix multiplication of basis matrix and in vector
+	glm::vec3 t = normalize(cross(n, q));
+	glm::vec3 b = normalize(cross(n, t));
+	return normalize(glm::vec3(t.x * in.x + b.x * in.y + n.x * in.z,
+								 t.y * in.x + b.y * in.y + n.y * in.z,
+								 t.z * in.x + b.z * in.y + n.z * in.z));
+}
+
+struct Hit 
+{
+	bool isHit = 0;
+	glm::vec3 pos;
+	glm::vec3 normal;
+	glm::vec3 color;
+};
+
+struct Camera 
+{
+	glm::vec3 pos;
+	glm::vec3 dir;
+	float invhalffov;
+	float maxdist = 10.0f;
+	glm::vec3 up;
+	glm::vec3 side;
+};
+
+
+// Distance estimation function
+float __device__ DE(const glm::vec3& pos, float time) 
+{
+	//return mandelbulbScene(pos, time);
+	//return sphereScene(pos);
+	return cornellBoxScene(pos);
+	//return mengerScene(pos, 6);
+	//return testFractalScene(pos, time);
+}
+
+glm::vec3 __device__ sceneColor(const glm::vec3& pos, float time) 
+{
+	//return glm::vec3(0.85f);
+	//return mandelbulbSceneColor(pos, time);
+	//return sphereColor(pos);
+	return cornellBoxColor(pos);
+}
+
+// Ray marching function, similar to intersect function in normal ray tracers
+__device__ Hit march(const glm::vec3& orig, const glm::vec3& direction, float time) 
+{
+	float totaldist = 0.0f;
+	float maxdist = length(direction);
+	glm::vec3 pos = orig; glm::vec3 dir = normalize(direction);
+	glm::vec3 col = glm::vec3(0.85f, 0.85f, 0.85f);
+
+	Hit hit;
+
+	while (totaldist < maxdist) 
+	{
+		float t = DE(pos, time);
+
+		// If distance is less than this then it is a hit.
+		if (t < MINDIST) 
+		{
+			// Calculate gradient (normal)
+			float fx = (DE(glm::vec3(pos.x + EPS, pos.y, pos.z), time) - DE(glm::vec3(pos.x - EPS, pos.y, pos.z), time));
+			float fy = (DE(glm::vec3(pos.x, pos.y + EPS, pos.z), time) - DE(glm::vec3(pos.x, pos.y - EPS, pos.z), time));
+			float fz = (DE(glm::vec3(pos.x, pos.y, pos.z + EPS), time) - DE(glm::vec3(pos.x, pos.y, pos.z - EPS), time));
+			glm::vec3 normal = normalize(glm::vec3(fx, fy, fz));
+			// faceforward
+			if (dot(-dir, normal) < 0) normal = -normal;
+
+			// create hit
+			hit.isHit = true;
+			hit.pos = pos;
+			hit.normal = normal;
+			hit.color = sceneColor(pos, time);
+			return hit;
+		}
+
+		// step forwards by t if no hit
+		totaldist += t;
+		pos += t * dir;
+	}
+
+	return hit;
+}
+
+// Path tracing function
+__device__ glm::vec4 trace(const glm::vec3& orig, const glm::vec3& direction, curandState* state, float time)
+{
+	float raylen = length(direction);
+	glm::vec3 dir = direction;
+	glm::vec3 o = orig;
+	glm::vec3 p = glm::vec3(0.0f); glm::vec3 n = glm::vec3(0.0f);
+	glm::vec3 mask = glm::vec3(1.0f); glm::vec3 color = glm::vec3(0.0f);
+
+	Hit rayhit = march(o, dir, time);
+	
+	for (int i = 0; i < BOUNCES + 1; i++) 
+	{
+		if (rayhit.isHit) 
+		{
+			p = rayhit.pos; n = rayhit.normal;
+			// Create new ray direction
+			glm::vec3 d = orient(n, state);
+			o = p + n * PUSH;
+			mask *= rayhit.color;
+			dir = raylen * d;
+			// Fire new ray if there are bounces left
+			if (i < BOUNCES) rayhit = march(o, dir, time);
+		}
+		else if (i == 0) return glm::vec4(glm::vec3(0.0f), 0.0f); // black background
+		else 
+		{
+			color += glm::vec3(1.0f) * mask; // add color when light (sky) is hit
+			break;
+		}
+	}
+	
+	return glm::vec4(color, 1.0f);
+}
+
+__global__ void render(int width, int height, float* result, Camera cam, unsigned long long seed, float time)
+{
+	int x = blockIdx.x * blockDim.x + threadIdx.x;
+	int y = blockIdx.y * blockDim.y + threadIdx.y;
+	if (x >= width || y >= height) return;
+
+	glm::vec4 color = glm::vec4(0.0f);
+
+	int block = blockIdx.x + blockIdx.y * gridDim.x;
+	unsigned long long idx = block * (blockDim.x * blockDim.y) + (threadIdx.y * blockDim.x) + threadIdx.x;
+	
+	curandState state;
+	curand_init(idx + seed, 0, 0, &state);
+
+	glm::vec2 samp = glm::vec2(x, y);
+	
+	for (int i = 0; i < SAMPLES * SAMPLES; i++) {
+		//glm::vec2 offset = getRandomSample(&state);
+		glm::vec2 offset = getJitteredSample(i, &state);
+		glm::vec2 sample = samp + offset;
+		float nx = (sample.x / float(width) - 0.5f) * 2.0f;
+		float ny = -(sample.y / float(height) - 0.5f) * 2.0f;
+		ny *= float(height) / float(width);
+		glm::vec3 raydir = normalize(cam.side * nx + cam.up * ny + cam.dir * cam.invhalffov);
+		color += trace(cam.pos, raydir * cam.maxdist, &state, time);
+	}
+	
+	color /= (SAMPLES * SAMPLES);
+
+	result[x * 4 + 4 * y * width + 0] = color.x;
+	result[x * 4 + 4 * y * width + 1] = color.y;
+	result[x * 4 + 4 * y * width + 2] = color.z;
+	result[x * 4 + 4 * y * width + 3] = color.w;
+}
+
+void saveImage(std::string path, int width, int height, const float colors[]) 
+{
+    std::vector<unsigned char> output;
+    output.resize(4 * width * height);
+    const int channels = 4;
+    for (int i = 0; i < width * height; i++)
+    {
+        output[i * 4 + 0] = static_cast<unsigned char>(std::fmax(std::fmin(colors[i * 4 + 0] * 255, 255), 0));
+        output[i * 4 + 1] = static_cast<unsigned char>(std::fmax(std::fmin(colors[i * 4 + 1] * 255, 255), 0));
+        output[i * 4 + 2] = static_cast<unsigned char>(std::fmax(std::fmin(colors[i * 4 + 2] * 255, 255), 0));
+        output[i * 4 + 3] = static_cast<unsigned char>(std::fmax(std::fmin(colors[i * 4 + 3] * 255, 255), 0));
     }
 
-    // Copy host vectors to device
-    cudaMemcpy( d_a, h_a, bytes, cudaMemcpyHostToDevice);
-    cudaMemcpy( d_b, h_b, bytes, cudaMemcpyHostToDevice);
- 
-    int blockSize, gridSize;
- 
-    // Number of threads in each thread block
-    blockSize = 1024;
- 
-    // Number of thread blocks in grid
-    gridSize = (int)ceil((float)n/blockSize);
- 
-    // Execute the kernel
-    vecAdd<<<gridSize, blockSize>>>(d_a, d_b, d_c, n);
- 
-    // Copy array back to host
-    cudaMemcpy( h_c, d_c, bytes, cudaMemcpyDeviceToHost );
- 
-    // Sum up vector c and print result divided by n, this should equal 1 within error
-    double sum = 0;
-    double ref_sum = 0;
-    for(i=0; i<n; i++) {
-        sum += h_c[i];
-        ref_sum += ref_c[i];
+    // Use stbi_write_png to save the image
+    int stride_in_bytes = width * channels; // Assuming no padding between rows
+    int result = stbi_write_png(path.c_str(), width, height, channels, output.data(), stride_in_bytes);
+    if (!result) {
+	    std::cout << "Error when outputting png. code " << result << std::endl;
     }
-    printf("final result, expected result: %f, %f\n", sum/(double)n, ref_sum/(double)n);
- 
-    // Release device memory
-    cudaFree(d_a);
-    cudaFree(d_b);
-    cudaFree(d_c);
- 
-    // Release host memory
-    free(h_a);
-    free(h_b);
-    free(h_c);
 
-    // write a png of all black
-    int width = 1920;
-    int height = 1080;
-    int channels = 3;
-    char *pixels = (char*)malloc(width*height*channels*sizeof(char));
-    for (int i = 0; i < width; i++) {
-        for (int j = 0; j < height; j++) {
-            for (int k = 0; k < channels; k++) {
-                pixels[i*height*channels + j*channels + k] = (char)(rand() % 255);
-            }
-        }
-    }
-    stbi_write_png("test.png", width, height, channels, pixels, width*channels);
+    return;
+}
 
-    auto map = new PhotonMap();
-    auto phots = new std::vector<PhotonMap::Photon>();
-    for (int i = 0; i < 1000000; i++) {
-        phots->emplace_back(glm::vec4(i, i, i, i), glm::vec4(0, 0, 0, 0), glm::vec4(0, 0, 0, 0));
-    }
-    
-    auto naive_start = std::chrono::high_resolution_clock::now();
-    glm::vec4 loc(1.4, 1.4, 1.4, 1.4);
-    int min_dist = 2000000;
-    PhotonMap::Photon naive_closest;
-    for (int i = 0; i < 1000000; i++) {
-        double dist = distance(loc, phots->at(i).position);
-        if (dist < min_dist) {
-            min_dist = dist;
-            naive_closest = phots->at(i);
-        }
-    }
-    auto naive_time = std::chrono::high_resolution_clock::now() - naive_start;
+int main()
+{
+	int width = 1920, height = 1080;
+	dim3 threads(BLOCK_SIZE, BLOCK_SIZE);
+	dim3 blocks(width / threads.x + 1, height / threads.y + 1);
+	
+	Camera cam;
+	cam.pos = glm::vec3(-1.0f, 1.5f, -3.0f);
+	//cam.pos = glm::vec3(0, 0.4f, -1.4f);
+	cam.dir = normalize(-cam.pos);
+	cam.side = normalize(cross(cam.dir, glm::vec3(0, 1, 0)));
+	cam.up = normalize(cross(cam.side, cam.dir));
+	float fov = 128.0f / 180.0f * float(M_PI);
+	cam.invhalffov = 1.0f / std::tan(fov / 2.0f);
 
-    std::cout << "Naive nearest neighbor took " << naive_time.count() << ", and found the nearest neighbor (" << naive_closest.position.x << ", "
-              << naive_closest.position.y << ", " << naive_closest.position.z << ", " << naive_closest.position.w << ") with a distance of "
-              << min_dist << std::endl;
+	for (int i = 0; i < FRAMES; i++) {
+		auto frame_start = std::chrono::high_resolution_clock::now();
+		float *deviceImage;
+		cudaMalloc(&deviceImage, 4 * width * height * sizeof(float));
+		
+		unsigned long long seed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+		
+		float t = 1.0f;
+		if (FRAMES > 1) t = float(i) / (FRAMES - 1.0f);
 
-    auto kd_start = std::chrono::high_resolution_clock::now();
-    map->buildMap(phots);
-    auto kd_closest = map->kNearestNeighbors(1, loc)[0];
-    auto kd_dist = distance(loc, kd_closest.position);
-    auto kd_time = std::chrono::high_resolution_clock::now() - kd_start;
-    std::cout << "KD nearest neighbor took " << kd_time.count() << ", and found the nearest neighbor (" << kd_closest.position.x << ", "
-              << kd_closest.position.y << ", " << kd_closest.position.z << ", " << kd_closest.position.w << ") with a distance of "
-              << kd_dist << std::endl;
-    return 0;
+		render << <blocks, threads >> >(width, height, deviceImage, cam, seed, t);
+		
+		float *hostImage = (float*)malloc(4 * width * height * sizeof(float));
+		cudaMemcpy(hostImage, deviceImage, 4 * width * height * sizeof(float), cudaMemcpyDeviceToHost);
+		std::string imageName = "../renders/render_" + std::to_string(i + 1) + ".png";
+		saveImage(imageName, width, height, hostImage);
+		cudaFree(deviceImage);
+		free(hostImage);
+
+    	auto frame_time =std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now() - frame_start);
+		std::cout << "Frame " << (i + 1) << " done! Took " << frame_time.count() << "ms to generate. Saved as " << imageName << "." << std::endl;
+	}
+
+	return 0;
 }

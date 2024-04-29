@@ -8,16 +8,23 @@
 #include "photon_map.h"
 
 void PhotonMap::buildMap(std::vector<Photon>* phots) {
-	photons = phots;
-
-	root = buildNode(phots, phots->size(), 0, 0);
+	psize = phots->size();
+	tree = new std::vector<Photon>(psize + 1);
+	buildNode(phots, psize, 0, 0, 0);
 }
 
-PhotonMap::PhotonNode *PhotonMap::buildNode(std::vector<Photon> *phots, size_t num_elems, size_t depth, size_t start) {
-	if (num_elems <= 0) {
-		return nullptr;
+void PhotonMap::printTree() {
+	for (int i = 0; i < tree->size(); i++) {
+		int axis = (int)trunc(log2(i)) % 4;
+		std::cout << "(" << tree->at(i).position.x << ", " << tree->at(i).position.y << ", " << tree->at(i).position.z << ", " << tree->at(i).position.w << ")" << std::endl;
 	}
-	int axis = depth % 3;
+}
+
+void PhotonMap::buildNode(std::vector<Photon> *phots, size_t num_elems, size_t depth, size_t start, int ind) {
+	if (num_elems <= 0) {
+		return;
+	}
+	int axis = depth % 4;
 
 	std::sort(phots->begin() + start, phots->begin() + start + num_elems,
 		[axis](Photon& p1, Photon& p2) {
@@ -27,18 +34,15 @@ PhotonMap::PhotonNode *PhotonMap::buildNode(std::vector<Photon> *phots, size_t n
 	size_t mid = (num_elems - 1) / 2;
 	Photon mid_phot = phots->at(start + mid);
 
-	PhotonNode *new_node = new PhotonNode();
-	new_node->photon = mid_phot;
-	new_node->left = buildNode(phots, mid, depth + 1, start);
-	new_node->right = buildNode(phots, num_elems - mid - 1, depth + 1, start + mid + 1);
-	return new_node;
-
+	tree->at(ind) = mid_phot;
+	buildNode(phots, mid, depth + 1, start, ind * 2 + 1);
+	buildNode(phots, num_elems - mid - 1, depth + 1, start + mid + 1, ind * 2 + 2);
 }
 
-std::vector <PhotonMap::Photon> PhotonMap::kNearestNeighbors(int k, glm::vec4 pos)
+std::vector <PhotonMap::Photon> PhotonMap::kNearestNeighbors(int k, glm::dvec4 pos)
 {
 	std::vector<photon_pair> nearest_photons;
-	kNearestHelper(root, k, 0, nearest_photons, pos);
+	kNearestHelper(k, 0, nearest_photons, pos, 0);
 	std::vector<PhotonMap::Photon> nearby_photons;
 	for (auto p = nearest_photons.begin(); p != nearest_photons.end(); p++)
 	{
@@ -63,14 +67,14 @@ void PhotonMap::mapPop(std::vector<photon_pair>& nearest_photons) {
 		}); nearest_photons.pop_back();
 }
 
-void PhotonMap::kNearestHelper(PhotonNode* start, int k, int depth, std::vector<photon_pair>& nearest_photons, glm::vec4 pos)
+void PhotonMap::kNearestHelper(int k, int depth, std::vector<photon_pair>& nearest_photons, glm::dvec4 pos, int ind)
 {
-	if (start == nullptr) {
+	if (ind >= psize) {
 		return;
 	}
 
-    auto tmp = start->photon.position - pos;
-	photon_pair med_pair = photon_pair((double)glm::dot(tmp, tmp), start->photon);
+    auto tmp = tree->at(ind).position - pos;
+	photon_pair med_pair = photon_pair((double)glm::dot(tmp, tmp), tree->at(ind));
 	mapPush(nearest_photons, med_pair);
 	if (nearest_photons.size() > k) {
 		mapPop(nearest_photons);
@@ -78,24 +82,24 @@ void PhotonMap::kNearestHelper(PhotonNode* start, int k, int depth, std::vector<
 
 
 	// Recurse down the closer axis
-	int axis = depth % 3;
-	bool closer_left = pos[axis] < start->photon.position[axis];
+	int axis = depth % 4;
+	bool closer_left = pos[axis] < tree->at(ind).position[axis];
 	if (closer_left)
 	{
-		kNearestHelper(start->left, k, depth + 1, nearest_photons, pos);
+		kNearestHelper(k, depth + 1, nearest_photons, pos, ind * 2 + 1);
 	}
 	else {
-		kNearestHelper(start->right, k, depth + 1, nearest_photons, pos);
+		kNearestHelper(k, depth + 1, nearest_photons, pos, ind * 2 + 2);
 	}
 
 	// if it makes sense to search other side as well (minimum distance overlaps), do so
-	double neighborDist = start->photon.position[axis] - pos[axis];
-	if (nearest_photons.front().first > neighborDist * neighborDist * neighborDist) {
+	double neighborDist = tree->at(ind).position[axis] - pos[axis];
+	if (nearest_photons.front().first > neighborDist) {
 		if (closer_left) {
-			kNearestHelper(start->right, k, depth + 1, nearest_photons, pos);
+			kNearestHelper(k, depth + 1, nearest_photons, pos, ind * 2 + 2);
 		}
 		else {
-			kNearestHelper(start->left, k, depth + 1, nearest_photons, pos);
+			kNearestHelper(k, depth + 1, nearest_photons, pos, ind * 2 + 1);
 		}
 	}
 }
