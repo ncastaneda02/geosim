@@ -14,12 +14,12 @@
 #include "stb_image_write.h"
 
 #define BLOCK_SIZE 8
-#define BOUNCES 2
+#define BOUNCES 4
 #define SAMPLES 8 // Total number of samples is SAMPLES*SAMPLES
 #define EPS 1e-5
 #define MINDIST 1.8e-3
 #define PUSH 0.0036f
-#define FRAMES 10
+#define FRAMES 60
 
 // Purely random pixel sample
 inline glm::vec2 __device__ getRandomSample(curandState* state) 
@@ -36,6 +36,7 @@ inline glm::vec2 __device__ getJitteredSample(int n, curandState* state) {
 
 glm::vec3 __device__ orient(const glm::vec3& n, curandState* state) 
 {
+	// TODO: Change this whole function to be hyperbolic
 	// rejection sampling hemisphere
 	float x = 1.0f, y = 1.0f;
 
@@ -102,6 +103,7 @@ glm::vec3 __device__ sceneColor(const glm::vec3& pos, float time)
 // Ray marching function, similar to intersect function in normal ray tracers
 __device__ Hit march(const glm::vec3& orig, const glm::vec3& direction, float time) 
 {
+	// TODO: use hyperbolic length and norm
 	float totaldist = 0.0f;
 	float maxdist = length(direction);
 	glm::vec3 pos = orig; glm::vec3 dir = normalize(direction);
@@ -111,12 +113,14 @@ __device__ Hit march(const glm::vec3& orig, const glm::vec3& direction, float ti
 
 	while (totaldist < maxdist) 
 	{
+		// TODO: Change distance estimator to use euclidean distance
 		float t = DE(pos, time);
 
 		// If distance is less than this then it is a hit.
 		if (t < MINDIST) 
 		{
 			// Calculate gradient (normal)
+			// TODO: Change vector gradient for hyperbolic changes, also use hyperbolic norm
 			float fx = (DE(glm::vec3(pos.x + EPS, pos.y, pos.z), time) - DE(glm::vec3(pos.x - EPS, pos.y, pos.z), time));
 			float fy = (DE(glm::vec3(pos.x, pos.y + EPS, pos.z), time) - DE(glm::vec3(pos.x, pos.y - EPS, pos.z), time));
 			float fz = (DE(glm::vec3(pos.x, pos.y, pos.z + EPS), time) - DE(glm::vec3(pos.x, pos.y, pos.z - EPS), time));
@@ -128,6 +132,7 @@ __device__ Hit march(const glm::vec3& orig, const glm::vec3& direction, float ti
 			hit.isHit = true;
 			hit.pos = pos;
 			hit.normal = normal;
+			// TODO: tweak scene color maybe?
 			hit.color = sceneColor(pos, time);
 			return hit;
 		}
@@ -143,6 +148,8 @@ __device__ Hit march(const glm::vec3& orig, const glm::vec3& direction, float ti
 // Path tracing function
 __device__ glm::vec4 trace(const glm::vec3& orig, const glm::vec3& direction, curandState* state, float time)
 {
+	// TODO: make sure this doesnt fuck everything up
+	// also use hyperbolic length
 	float raylen = length(direction);
 	glm::vec3 dir = direction;
 	glm::vec3 o = orig;
@@ -157,6 +164,7 @@ __device__ glm::vec4 trace(const glm::vec3& orig, const glm::vec3& direction, cu
 		{
 			p = rayhit.pos; n = rayhit.normal;
 			// Create new ray direction
+			// TODO: Change new ray direction to flow along geodesic
 			glm::vec3 d = orient(n, state);
 			o = p + n * PUSH;
 			mask *= rayhit.color;
@@ -195,6 +203,7 @@ __global__ void render(int width, int height, float* result, Camera cam, unsigne
 		//glm::vec2 offset = getRandomSample(&state);
 		glm::vec2 offset = getJitteredSample(i, &state);
 		glm::vec2 sample = samp + offset;
+		// TODO: CHANGE FLOW OF RAY OUT OF CAMERA TO BE ALONG GEODESIC
 		float nx = (sample.x / float(width) - 0.5f) * 2.0f;
 		float ny = -(sample.y / float(height) - 0.5f) * 2.0f;
 		ny *= float(height) / float(width);
@@ -233,6 +242,20 @@ void saveImage(std::string path, int width, int height, const float colors[])
     return;
 }
 
+void moveCamera(Camera &cam, double theta, int r) {
+	double newx = r * cos(theta);
+	double newz = r * sin(theta);
+	cam.pos.x = newx;
+	cam.pos.z = newz;
+	cam.dir.x = -newx;
+	cam.dir.z = -newz;
+	cam.dir = normalize(cam.dir);
+	cam.side = normalize(cross(cam.dir, glm::vec3(0, 1, 0)));
+	cam.up = normalize(cross(cam.side, cam.dir));
+	float fov = 128.0f / 180.0f * float(M_PI);
+	cam.invhalffov = 1.0f / std::tan(fov / 2.0f);
+}
+
 int main()
 {
 	int width = 1920, height = 1080;
@@ -240,14 +263,17 @@ int main()
 	dim3 blocks(width / threads.x + 1, height / threads.y + 1);
 	
 	Camera cam;
-	cam.pos = glm::vec3(-1.0f, 1.5f, -3.0f);
+	cam.pos = glm::vec3(0.0f, 1.0f, -4.0f);
+	//cam.pos = glm::vec3(-1.0f, 1.5f, -3.0f);
 	//cam.pos = glm::vec3(0, 0.4f, -1.4f);
-	cam.dir = normalize(-cam.pos);
+	cam.dir = normalize(glm::vec3(0.0f, 0.0f, 1.0f));
 	cam.side = normalize(cross(cam.dir, glm::vec3(0, 1, 0)));
 	cam.up = normalize(cross(cam.side, cam.dir));
 	float fov = 128.0f / 180.0f * float(M_PI);
 	cam.invhalffov = 1.0f / std::tan(fov / 2.0f);
-
+	double radius = 4.0;
+	double step = 2.0 * M_PI / (FRAMES - 2.0);
+	std::cout << "step size: " << step << std::endl;
 	for (int i = 0; i < FRAMES; i++) {
 		auto frame_start = std::chrono::high_resolution_clock::now();
 		float *deviceImage;
@@ -269,6 +295,7 @@ int main()
 
     	auto frame_time =std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now() - frame_start);
 		std::cout << "Frame " << (i + 1) << " done! Took " << frame_time.count() << "ms to generate. Saved as " << imageName << "." << std::endl;
+		moveCamera(cam, step * i - (M_PI / 2.0), 3);
 	}
 
 	return 0;
